@@ -1,0 +1,19 @@
+[package]
+name = "tuddenham-tca-loader"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+description = "Open reimplementation of a TCA-style UICC and eUICC application loader"
+repository = "https://github.com/AlexsCodingAgent/tuddenham-tca-loader"
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+pcsc = "2.8"
+
+[profile.release]
+lto = true
+strip = true
