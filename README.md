@@ -11,6 +11,31 @@ SCP03 over HTTPS, and keeps SCP02, CAT-TP and SMS for older deployments.
 This project is the same job in the open. Right now it does the read half, which is the part
 that has to be right before anything writes to a card.
 
+## The secure channel (SCP03)
+
+```
+$ tca-loader auth                     # GlobalPlatform test keys
+$ tca-loader auth --keys enc:mac:dek  # real keys, 16 bytes each in hex
+$ tca-loader auth --security-level 33 # add C-DECRYPTION and response protection
+```
+
+`auth` sends INITIALIZE UPDATE, checks the card cryptogram against the static keys, derives
+S-ENC, S-MAC and S-RMAC, sends EXTERNAL AUTHENTICATE, and then proves the channel by running a
+MAC-wrapped GET STATUS through it.
+
+Three things make this trustworthy without a card to test on:
+
+- CMAC is checked against the RFC 4493 vectors
+- the key derivation is checked against an independent implementation (pycryptodome, with
+  GlobalPlatform's field order rather than NIST's) for the standard test keys and a fixed pair
+  of challenges
+- the C-MAC chains, so the same command never carries the same MAC twice
+
+What has not happened yet: a live card. The reader here holds a USIM, which answers SELECT on
+A0000001510000 with 617F and INITIALIZE UPDATE with 6E00 (class not supported), so there is no
+GlobalPlatform issuer security domain to authenticate to. The next real step is a GP or eUICC
+sample; until then this is verified against vectors, not against silicon.
+
 ## What works today
 
 ```
