@@ -39,6 +39,57 @@ enum Command {
         #[arg(long)]
         isd_only: bool,
     },
+    /// Read a CAP file and print what a card would be sent.
+    Cap {
+        /// Path to the .cap file.
+        file: String,
+        /// Bytes per LOAD block, used only to report the block count.
+        #[arg(long, default_value_t = 245)]
+        block_size: usize,
+    },
+    /// Load a CAP file over an SCP03 channel and install it.
+    Load {
+        /// Path to the .cap file.
+        file: String,
+        /// Security domain AID to authenticate to; the issuer domain is the default.
+        #[arg(long)]
+        sd: Option<String>,
+        /// Application privileges as a hex bit field.
+        #[arg(long, default_value = "0")]
+        privileges: String,
+        /// Applet install parameters, hex.
+        #[arg(long)]
+        params: Option<String>,
+        /// Bytes per LOAD command.
+        #[arg(long, default_value_t = 245)]
+        block_size: usize,
+        /// Application instance AID; the applet's own AID is the default.
+        #[arg(long)]
+        instance_aid: Option<String>,
+        /// Load the file but do not install an instance.
+        #[arg(long)]
+        no_install: bool,
+        /// Install without making the application selectable.
+        #[arg(long)]
+        not_selectable: bool,
+        /// Static keys as enc:mac:dek in hex, 16 bytes each.
+        #[arg(long)]
+        keys: Option<String>,
+    },
+    /// Delete an application, load file or security domain by AID.
+    Delete {
+        /// AID to delete, hex.
+        aid: String,
+        /// Also delete the objects that depend on it.
+        #[arg(long)]
+        related: bool,
+        /// Security domain AID to authenticate to.
+        #[arg(long)]
+        sd: Option<String>,
+        /// Static keys as enc:mac:dek in hex, 16 bytes each.
+        #[arg(long)]
+        keys: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -49,11 +100,23 @@ fn main() -> Result<()> {
         Command::Auth { test_keys: _, keys, security_level, aid } =>
             auth(cli.reader.as_deref(), keys, security_level, aid),
         Command::Status { isd_only } => status(cli.reader.as_deref(), isd_only),
+        Command::Cap { file, block_size } => cap_info(&file, block_size),
+        Command::Load { file, sd, privileges, params, block_size, instance_aid, no_install,
+                        not_selectable, keys } =>
+            load_cap(cli.reader.as_deref(), &file, sd, &privileges, params, block_size,
+                     instance_aid, no_install, not_selectable, keys),
+        Command::Delete { aid, related, sd, keys } =>
+            delete(cli.reader.as_deref(), &aid, related, sd, keys),
     }
 }
 
 fn parse_hex_u8(s: &str) -> std::result::Result<u8, String> {
     u8::from_str_radix(s.trim_start_matches("0x"), 16).map_err(|e| e.to_string())
+}
+
+fn hex_bytes(spec: &str) -> Result<Vec<u8>> {
+    hex::decode(spec.replace(' ', "").trim_start_matches("0x"))
+        .map_err(|e| anyhow::anyhow!("not hex: {e}"))
 }
 
 fn parse_keys(spec: &str) -> Result<tuddenham_tca_loader::scp03::Scp03Keys> {
@@ -197,4 +260,138 @@ fn status(reader: Option<&str>, isd_only: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn cap_info(file: &str, block_size: usize) -> Result<()> {
+    use tuddenham_tca_loader::cap::CapFile;
+
+    let cap = CapFile::open(std::path::Path::new(file))?;
+    println!("package AID:  {}", hex::encode(&cap.package_aid).to_uppercase());
+    println!("package ver:  {}.{}", cap.version.0, cap.version.1);
+    println!("CAP version:  {}.{}", cap.cap_version.0, cap.cap_version.1);
+    println!("load file:    {} bytes in {} blocks of {}",
+             cap.load_file.len(), cap.blocks(block_size).len(), block_size);
+    println!("components:");
+    for (name, bytes) in cap.components.iter() {
+        println!("  {:<14} {:>6} bytes", name, bytes.len());
+    }
+    if cap.applets.is_empty() {
+        println!("applets:      none (library package)");
+    } else {
+        println!("applets:");
+        for applet in cap.applets.iter() {
+            println!("  {}  install method at {}", hex::encode(&applet.aid).to_uppercase(),
+                     applet.install_offset);
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_cap(
+    reader: Option<&str>,
+    file: &str,
+    sd: Option<String>,
+    privileges: &str,
+    params: Option<String>,
+    block_size: usize,
+    instance_aid: Option<String>,
+    no_install: bool,
+    not_selectable: bool,
+    keys: Option<String>,
+) -> Result<()> {
+    use tuddenham_tca_loader::cap::CapFile;
+    use tuddenham_tca_loader::load::{load, LoadOptions};
+
+    let cap = CapFile::open(std::path::Path::new(file))?;
+    let privileges = u32::from_str_radix(privileges.trim_start_matches("0x"), 16)
+        .map_err(|e| anyhow::anyhow!("privileges are not hex: {e}"))?;
+    let params = match params {
+        Some(spec) => hex_bytes(&spec)?,
+        None => Vec::new(),
+    };
+    let instance_aid = match instance_aid {
+        Some(spec) => Some(hex_bytes(&spec)?),
+        None => None,
+    };
+
+    println!("package {} ({} bytes, {} blocks)",
+             hex::encode(&cap.package_aid).to_uppercase(),
+             cap.load_file.len(), cap.blocks(block_size).len());
+
+    let (mut card, mut session) = open_session(reader, sd, keys)?;
+    let options = LoadOptions {
+        block_size,
+        privileges,
+        params,
+        make_selectable: !not_selectable,
+        instance_aid,
+        hash: None,
+        prepare_only: no_install,
+    };
+    let result = load(&mut card, &mut session, &cap, &options, |done, total| {
+        if done == total || done % 10 == 0 {
+            print!("\r  LOAD {done}/{total} blocks");
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+        }
+    })?;
+    println!();
+    println!("loaded {} bytes in {} blocks", result.bytes, result.blocks);
+    match result.instance_aid {
+        Some(aid) => println!("installed {}", aid.to_uppercase()),
+        None => println!("no instance installed (--no-install)"),
+    }
+    Ok(())
+}
+
+fn delete(
+    reader: Option<&str>,
+    aid: &str,
+    related: bool,
+    sd: Option<String>,
+    keys: Option<String>,
+) -> Result<()> {
+    let bytes = hex_bytes(aid)?;
+    let (mut card, mut session) = open_session(reader, sd, keys)?;
+    tuddenham_tca_loader::load::delete(&mut card, &mut session, &bytes, related)?;
+    println!("deleted {}{}", aid.to_uppercase(), if related { " and its objects" } else { "" });
+    Ok(())
+}
+
+fn open_session(
+    reader: Option<&str>,
+    sd: Option<String>,
+    keys: Option<String>,
+) -> Result<(PcscTransport, tuddenham_tca_loader::session::Session)> {
+    use tuddenham_tca_loader::session::Session;
+
+    let static_keys = match keys {
+        Some(spec) => parse_keys(&spec)?,
+        None => tuddenham_tca_loader::scp03::TEST_KEYS,
+    };
+    let mut card = PcscTransport::open(reader)?;
+    println!("reader: {}", card.describe());
+
+    let sd_bytes = match sd {
+        Some(spec) => {
+            let bytes = hex_bytes(&spec)?;
+            let resp = gp::select_aid(&mut card, &bytes)?;
+            if !resp.is_ok() {
+                anyhow::bail!("selecting {spec} failed: {} ({:04X})", resp.describe(), resp.status());
+            }
+            bytes
+        }
+        None => {
+            gp::select_isd(&mut card)?;
+            hex::decode("A000000003000000").expect("constant AID")
+        }
+    };
+
+    let mut session = Session::establish(&mut card, &static_keys, 0x01)
+        .context("opening the secure channel")?;
+    session.sd_aid = sd_bytes;
+    println!("secure channel: SCP03, {}-byte MAC, domain {}",
+             session.mode, hex::encode(&session.sd_aid).to_uppercase());
+    Ok((card, session))
 }

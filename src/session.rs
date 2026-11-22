@@ -14,6 +14,8 @@ use crate::scp03::{Scp03Keys, SessionKeys};
 pub struct Session {
     pub keys: SessionKeys,
     pub mode: usize,
+    /// The security domain that received the load file. Every INSTALL names it.
+    pub sd_aid: Vec<u8>,
 }
 
 impl Session {
@@ -55,7 +57,11 @@ impl Session {
         let session_keys = SessionKeys::derive(keys, &host_challenge, card_challenge, mode);
         let host_cryptogram = SessionKeys::host_cryptogram(keys, &host_challenge, card_challenge, mode);
 
-        let mut session = Self { keys: session_keys, mode };
+        let mut session = Self {
+            keys: session_keys,
+            mode,
+            sd_aid: hex::decode("A000000003000000").expect("constant AID"),
+        };
         // EXTERNAL AUTHENTICATE carries the host cryptogram and a C-MAC over itself
         let mut data = host_cryptogram;
         let header = [0x84u8, 0x82, security_level, 0x00, (data.len() + mode) as u8];
@@ -91,6 +97,46 @@ impl Session {
     pub fn transmit<T: Transport>(&mut self, card: &mut T, apdu: &[u8]) -> Result<Response> {
         let raw = card.transmit(apdu)?;
         Ok(Response::from_bytes(&raw)?)
+    }
+
+    /// Wrap, send, and finish the exchange the card actually wants: 61xx means "ask again with GET
+    /// RESPONSE", 6Cxx means the length byte was wrong. Both are normal card behaviour on loads and
+    /// neither is an error.
+    pub fn execute<T: Transport>(
+        &mut self,
+        card: &mut T,
+        cla: u8,
+        ins: u8,
+        p1: u8,
+        p2: u8,
+        data: &[u8],
+        le: Option<u8>,
+    ) -> Result<Response> {
+        let apdu = self.wrap(cla, ins, p1, p2, data, le);
+        let mut resp = self.transmit(card, &apdu)?;
+        loop {
+            match resp.status() {
+                0x6C00..=0x6CFF => {
+                    // the card wants a different Le: fix ours and ask once more
+                    let correct = (resp.status() & 0xFF) as u8;
+                    let mut retry = apdu.clone();
+                    if le.is_some() {
+                        *retry.last_mut().expect("Le present") = correct;
+                    } else {
+                        retry.push(correct);
+                    }
+                    resp = self.transmit(card, &retry)?;
+                }
+                0x6100..=0x61FF => {
+                    let want = (resp.status() & 0xFF) as u8;
+                    let get = [0x00u8, 0xC0, 0x00, 0x00, want];
+                    let more = self.transmit(card, &get)?;
+                    return Ok(more);
+                }
+                _ => break,
+            }
+        }
+        Ok(resp)
     }
 }
 

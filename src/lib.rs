@@ -16,8 +16,11 @@
 //! Authentication opens the channel; it does not yet write anything to the card.
 
 pub mod apdu;
+pub mod cap;
 pub mod card;
+pub mod commands;
 pub mod gp;
+pub mod load;
 pub mod scp03;
 pub mod session;
 pub mod tlv;
