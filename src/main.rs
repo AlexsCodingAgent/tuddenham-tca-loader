@@ -39,6 +39,23 @@ enum Command {
         #[arg(long)]
         isd_only: bool,
     },
+    /// Work out what the card is when the security domain does not answer at the usual AID:
+    /// ATR, the EF_DIR application list, and a sweep of known security domain AIDs.
+    Probe,
+    /// Read and decode the key information template: which key sets exist, of what type.
+    Keys {
+        /// Security domain AID; the standard issuer domain is the default.
+        #[arg(long)]
+        sd: Option<String>,
+    },
+    /// Send a raw APDU, hex, and print the response. For working out what a card wants.
+    Raw {
+        /// Command APDU in hex.
+        apdu: String,
+        /// Select this AID first, hex.
+        #[arg(long)]
+        select: Option<String>,
+    },
     /// Read a CAP file and print what a card would be sent.
     Cap {
         /// Path to the .cap file.
@@ -100,6 +117,9 @@ fn main() -> Result<()> {
         Command::Auth { test_keys: _, keys, security_level, aid } =>
             auth(cli.reader.as_deref(), keys, security_level, aid),
         Command::Status { isd_only } => status(cli.reader.as_deref(), isd_only),
+        Command::Probe => probe(cli.reader.as_deref()),
+        Command::Keys { sd } => keys(cli.reader.as_deref(), sd),
+        Command::Raw { apdu, select } => raw(cli.reader.as_deref(), &apdu, select),
         Command::Cap { file, block_size } => cap_info(&file, block_size),
         Command::Load { file, sd, privileges, params, block_size, instance_aid, no_install,
                         not_selectable, keys } =>
@@ -394,4 +414,211 @@ fn open_session(
     println!("secure channel: SCP03, {}-byte MAC, domain {}",
              session.mode, hex::encode(&session.sd_aid).to_uppercase());
     Ok((card, session))
+}
+
+fn probe(reader: Option<&str>) -> Result<()> {
+    let mut card = PcscTransport::open(reader)?;
+    println!("reader: {}", card.describe());
+    println!("ATR:    {}", card.atr_hex().unwrap_or_else(|e| format!("unavailable ({e})")));
+
+    fn sw_of(raw: &[u8]) -> u16 {
+        if raw.len() >= 2 {
+            u16::from_be_bytes([raw[raw.len() - 2], raw[raw.len() - 1]])
+        } else {
+            0
+        }
+    }
+
+    /// SELECT by AID asking for the FCI back, which is where a GlobalPlatform card states its
+    /// secure channel protocol and key version.
+    fn select_fci(card: &mut PcscTransport, aid: &[u8]) -> Result<(Vec<u8>, u16)> {
+        let mut apdu = vec![0x00u8, 0xA4, 0x04, 0x00, aid.len() as u8];
+        apdu.extend_from_slice(aid);
+        apdu.push(0x00);
+        let raw = card.transmit_full(&apdu)?;
+        let sw = sw_of(&raw);
+        Ok((raw[..raw.len().saturating_sub(2)].to_vec(), sw))
+    }
+
+    fn walk(data: &[u8], depth: usize) {
+        let mut at = 0usize;
+        while at + 2 <= data.len() {
+            let mut tag = data[at] as u32;
+            let mut cursor = at + 1;
+            if (data[at] & 0x1F) == 0x1F && cursor < data.len() {
+                tag = (tag << 8) | data[cursor] as u32;
+                cursor += 1;
+            }
+            if cursor >= data.len() {
+                break;
+            }
+            let mut len = data[cursor] as usize;
+            cursor += 1;
+            if len == 0x81 && cursor < data.len() {
+                len = data[cursor] as usize;
+                cursor += 1;
+            } else if len == 0x82 && cursor + 1 < data.len() {
+                len = ((data[cursor] as usize) << 8) | data[cursor + 1] as usize;
+                cursor += 2;
+            }
+            if cursor + len > data.len() {
+                break;
+            }
+            let value = &data[cursor..cursor + len];
+            let label = match tag {
+                0x6F => "FCI",
+                0x84 => "DF name (AID)",
+                0xA5 => "proprietary",
+                0x88 => "SCP i parameter",
+                0x9F65 => "max command data",
+                0x9F6E => "SCP03 parameters (key version, SCP id, i)",
+                0xC0 => "key information template",
+                0xC1 => "key information",
+                _ => "",
+            };
+            let printable = value.iter().all(|b| *b >= 0x20 && *b < 0x7F);
+            if printable && !value.is_empty() {
+                println!("{}{:04X} {:<42} \"{}\"",
+                         "  ".repeat(depth), tag, label, String::from_utf8_lossy(value));
+            } else {
+                println!("{}{:04X} {:<42} {}", "  ".repeat(depth), tag, label, hex::encode(value).to_uppercase());
+            }
+            if matches!(tag, 0x6F | 0xA5 | 0xC0 | 0xC1) {
+                walk(value, depth + 1);
+            }
+            at = cursor + len;
+        }
+    }
+
+    println!();
+    for (name, aid_hex) in [
+        ("GP issuer domain", "A000000003000000"),
+        ("GP 2.0.1 issuer domain", "A0000000030000"),
+        ("GP card manager", "A000000151000000"),
+        ("GP card manager (7 byte)", "A0000001510000"),
+        ("GSMA ISD-R", "A0000005591010FFFFFF8901000000"),
+        ("USIM", "A0000000871002"),
+        ("ISIM", "A0000000871004"),
+    ] {
+        let bytes = hex::decode(aid_hex).expect("constant");
+        let (fci, sw) = select_fci(&mut card, &bytes)?;
+        let note = match sw {
+            0x9000 => "present",
+            0x6A82 => "absent",
+            0x6D00 => "no such instruction for this AID",
+            _ => "",
+        };
+        println!("{name:<26} {aid_hex}  {sw:04X} {note}");
+        if sw == 0x9000 && !fci.is_empty() {
+            walk(&fci, 1);
+            // the key information template says which key versions and types exist
+            let raw = card.transmit_full(&[0x80u8, 0xCA, 0x00, 0xE0, 0x00])?;
+            let sw = sw_of(&raw);
+            println!("    GET DATA 00E0 (key information): {sw:04X}");
+            if sw == 0x9000 {
+                walk(&raw[..raw.len() - 2], 2);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn raw(reader: Option<&str>, apdu: &str, select: Option<String>) -> Result<()> {
+    let mut card = PcscTransport::open(reader)?;
+    println!("reader: {}", card.describe());
+    if let Some(spec) = select {
+        let aid = hex_bytes(&spec)?;
+        let mut cmd = vec![0x00u8, 0xA4, 0x04, 0x00, aid.len() as u8];
+        cmd.extend_from_slice(&aid);
+        cmd.push(0x00);
+        let resp = card.transmit_full(&cmd)?;
+        println!("select  -> {}", hex::encode(&resp).to_uppercase());
+    }
+    // several APDUs can be chained with commas, which is the only way to keep card state
+    let mut last;
+    for (index, part) in apdu.split(',').enumerate() {
+        let bytes = hex_bytes(part)?;
+        last = card.transmit_full(&bytes)?;
+        let sw = if last.len() >= 2 {
+            u16::from_be_bytes([last[last.len() - 2], last[last.len() - 1]])
+        } else { 0 };
+        println!("apdu {:<2} -> {:04X}  {}", index + 1, sw, hex::encode(&last).to_uppercase());
+    }
+    Ok(())
+}
+
+fn key_type_name(value: u8) -> &'static str {
+    match value {
+        0x80 => "AES",
+        0x81 => "3DES (2-key)",
+        0x82 => "3DES (3-key)",
+        0x83 => "DES",
+        0x84 => "RSA public exponent/modulus",
+        0x85 => "RSA private exponent/modulus",
+        0x88 => "AES (SM4?)",
+        _ => "unknown",
+    }
+}
+
+/// Decode the C0 key information entries: key version, key index, type, length.
+fn decode_key_info(data: &[u8]) -> Vec<(u8, u8, u8, u8)> {
+    let mut out = Vec::new();
+    // the template is wrapped in E0; enter it before reading the C0 entries
+    let data = if data.len() > 2 && data[0] == 0xE0 {
+        let len = data[1] as usize;
+        if data.len() >= 2 + len { &data[2..2 + len] } else { &data[2..] }
+    } else {
+        data
+    };
+    let mut at = 0usize;
+    while at + 2 <= data.len() {
+        let tag = data[at];
+        let len = data[at + 1] as usize;
+        if at + 2 + len > data.len() {
+            break;
+        }
+        let value = &data[at + 2..at + 2 + len];
+        if tag == 0xC0 && value.len() >= 4 {
+            out.push((value[0], value[1], value[2], value[3]));
+        }
+        at += 2 + len;
+    }
+    out
+}
+
+fn keys(reader: Option<&str>, sd: Option<String>) -> Result<()> {
+    let mut card = PcscTransport::open(reader)?;
+    println!("reader: {}", card.describe());
+    let aid = match sd {
+        Some(spec) => hex_bytes(&spec)?,
+        None => hex::decode("A000000003000000").expect("constant"),
+    };
+    let mut select = vec![0x00u8, 0xA4, 0x04, 0x00, aid.len() as u8];
+    select.extend_from_slice(&aid);
+    select.push(0x00);
+    let resp = card.transmit_full(&select)?;
+    let sw = u16::from_be_bytes([resp[resp.len() - 2], resp[resp.len() - 1]]);
+    if sw != 0x9000 {
+        anyhow::bail!("selecting {} failed: {sw:04X}", hex::encode(&aid).to_uppercase());
+    }
+
+    let raw = card.transmit_full(&[0x80u8, 0xCA, 0x00, 0xE0, 0x20])?;
+    let sw = u16::from_be_bytes([raw[raw.len() - 2], raw[raw.len() - 1]]);
+    if sw != 0x9000 {
+        anyhow::bail!("GET DATA 00E0 failed: {sw:04X}. The card will not disclose its key sets");
+    }
+    let entries = decode_key_info(&raw[..raw.len() - 2]);
+    if entries.is_empty() {
+        println!("no key information returned");
+        return Ok(());
+    }
+    println!("{:<4} {:<5} {:<8} {:<7} {}", "KVN", "INDEX", "TYPE", "BYTES", "MEANS");
+    for (kvn, index, kind, len) in entries {
+        println!("{:<4} {:<5} 0x{:02X}     {:<7} {}", kvn, index, kind, len, key_type_name(kind));
+    }
+    println!();
+    println!("These are the key sets the card holds. Without the matching static keys the channel");
+    println!("cannot be opened, and no loader can proceed; the values above are what you ask the");
+    println!("card issuer for.");
+    Ok(())
 }

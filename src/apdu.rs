@@ -97,6 +97,11 @@ impl Response {
             0x6A80 => "wrong data: malformed or unsupported value",
             0x6A84 => "not enough memory on the card",
             0x6A88 => "referenced data not found",
+            0x6881 => "logical channel not supported: this card has channel 0 only",
+            0x6882 => "secure messaging not supported here: the card refuses INITIALIZE UPDATE in \
+                       its current state or for this key version",
+            0x6883 => "last command of the chain expected",
+            0x6884 => "command chaining not supported",
             0x6A82 => "file or application not found",
             0x6A86 => "incorrect P1 or P2",
             0x6D00 => "instruction not supported by this card",

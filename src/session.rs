@@ -29,8 +29,18 @@ impl Session {
         let resp = card.transmit(&cmd).context("INITIALIZE UPDATE")?;
         let response = Response::from_bytes(&resp)?;
         if !response.is_ok() {
-            bail!("card refused INITIALIZE UPDATE: {} ({:04X})",
-                  response.describe(), response.status());
+            let sw = response.status();
+            let extra = match sw {
+                0x6882 => "\n  The card manager exists and advertises a secure channel, but will not \
+start one now. On SIM-shaped cards this usually means the domain is terminated, locked, or \
+waiting for a state change that needs an authentication you do not have. GET DATA 00E0 still \
+answers, and lists the key versions and types you would need.",
+                0x6E00 => "\n  CLA 0x80 is not supported by the selected application: it is a USIM or \
+ISIM applet, not a GlobalPlatform security domain. Select the card manager AID first.",
+                _ => "",
+            };
+            bail!("card refused INITIALIZE UPDATE: {} ({:04X}){extra}",
+                  response.describe(), sw);
         }
         let body = &response.data;
         if body.len() < 29 {

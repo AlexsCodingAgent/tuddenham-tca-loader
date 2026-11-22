@@ -31,10 +31,38 @@ Three things make this trustworthy without a card to test on:
   of challenges
 - the C-MAC chains, so the same command never carries the same MAC twice
 
-What has not happened yet: a live card. The reader here holds a USIM, which answers SELECT on
-A0000001510000 with 617F and INITIALIZE UPDATE with 6E00 (class not supported), so there is no
-GlobalPlatform issuer security domain to authenticate to. The next real step is a GP or eUICC
-sample; until then this is verified against vectors, not against silicon.
+### What the card in the reader says
+
+The card here is a GlobalPlatform card whose security domain is not at the classic AID, and
+`probe` is how that was established rather than guessed:
+
+```
+$ tca-loader probe
+ATR:    3B9F97C00A3FC6828031E073FE211F65D002331640810F07
+GP issuer domain        A000000003000000  6A82 absent
+GP card manager         A000000151000000  9000 present
+  FCI:  A000000151000000, SCP03, max command data 255
+USIM                    A0000000871002  9000 present
+ISIM                    A0000000871004  9000 present
+
+$ tca-loader keys --sd A000000151000000
+KVN  INDEX TYPE     BYTES   MEANS
+1    1     0x80     16      AES
+2    1     0x80     16      AES
+3    1     0x80     16      AES
+2    64    0x82     16      3DES (3-key)
+1    64    0x85     16      RSA private exponent/modulus
+```
+
+So: SCP03 with three AES-128 key set versions, a legacy 3DES set, and an RSA key for DAP. What
+the card will not do is start a secure channel: INITIALIZE UPDATE answers `6882` for every key
+version, which is a card-state refusal rather than a key problem, because INITIALIZE UPDATE does
+not use the keys at all. A card in that state cannot be authenticated by anyone until whatever it
+is waiting for happens, which is why the tool reports the status word and what it means instead
+of "wrong keys".
+
+Everything above is read without authentication, which is the point: the card discloses what it
+is and which keys it wants before anyone holds them.
 
 ## Loading
 
@@ -75,6 +103,21 @@ That is a real check of the sequence and the encoding. It is not a substitute fo
 things only silicon can confirm are block size negotiation, timing, and what a particular
 security domain wants in its install parameters.
 
+## Working out what a card is
+
+```
+$ tca-loader probe                      # ATR, EF_DIR, candidate AIDs, FCI and SCP parameters
+$ tca-loader keys --sd <aid>            # key versions, types and lengths
+$ tca-loader raw 8050000008000102030405060700          # one APDU
+$ tca-loader raw "00A4000C023F00,00B2010426"           # several, sharing card state
+```
+
+`raw` chains APDUs because state is the whole problem with a card: an EF only reads after it has
+been selected in the same session. Small refinements that make real cards work: the transport
+follows `61xx` with GET RESPONSE itself, retries `6Cxx` with the length the card asked for,
+reconnects once if the card drops the transaction, and cold-resets on open so a card manager that
+has already seen an authentication does not answer `6882` to the next one.
+
 ## What works today
 
 ```
@@ -95,6 +138,10 @@ AID                      STATE        PRIVILEGES
 A000000003000000         PERSONALIZED 9E
 ```
 
+- `probe` identifies a card whose security domain is not at the usual AID: ATR, EF_DIR
+  applications, candidate AIDs with their FCI, and the SCP parameters the card advertises
+- `keys` decodes the key information template: which key versions exist, of what type, how long
+- `raw` sends hand-written APDUs, which is how the card above was worked out
 - `readers` lists PC/SC readers and whether a card is present, with the protocol in use
 - `info` selects the issuer security domain, then reads the card image number, CPLC, issuer
   identification number and card recognition data

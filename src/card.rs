@@ -19,6 +19,47 @@ pub struct PcscTransport {
 }
 
 impl PcscTransport {
+    /// Send a command and collect the whole response, following 61xx with GET RESPONSE.
+    /// Reconnects once if the card drops the transaction, which happens after a refused select.
+    pub fn transmit_full(&mut self, command: &[u8]) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut current = command.to_vec();
+        let mut buf = [0u8; 4096];
+        for _ in 0..8 {
+            let raw = match self.card.transmit(&current, &mut buf) {
+                Ok(raw) => raw.to_vec(),
+                Err(_) => {
+                    let _ = self.card.reconnect(pcsc::ShareMode::Shared,
+                                                pcsc::Protocols::ANY,
+                                                pcsc::Disposition::LeaveCard);
+                    let again = self.card.transmit(&current, &mut buf)?;
+                    again.to_vec()
+                }
+            };
+            if raw.len() < 2 {
+                return Ok(raw);
+            }
+            let (sw1, sw2) = (raw[raw.len() - 2], raw[raw.len() - 1]);
+            out.extend_from_slice(&raw[..raw.len() - 2]);
+            if sw1 == 0x61 {
+                current = vec![0x00, 0xC0, 0x00, 0x00, sw2];
+                continue;
+            }
+            out.extend_from_slice(&[sw1, sw2]);
+            return Ok(out);
+        }
+        Ok(out)
+    }
+
+    /// The ATR of the card in this reader, hex encoded.
+    pub fn atr_hex(&self) -> Result<String> {
+        let mut atr = [0u8; 64];
+        let mut names = [0u8; 4096];
+        let status = self.card.status2(&mut atr, &mut names)
+            .map_err(|e| anyhow::anyhow!("reading the ATR: {e}"))?;
+        Ok(hex::encode(status.atr()).to_uppercase())
+    }
+
     /// Open the first reader that holds a card, or the named one.
     pub fn open(reader: Option<&str>) -> Result<Self> {
         let ctx = pcsc::Context::establish(pcsc::Scope::User)
@@ -40,18 +81,20 @@ impl PcscTransport {
         let card = ctx
             .connect(&cname, pcsc::ShareMode::Shared, pcsc::Protocols::ANY)
             .with_context(|| format!("cannot connect to a card in {chosen}"))?;
+        // A cold reset puts the card in a known state: a Card Manager that has already seen an
+        // authentication (or is mid-transaction) refuses INITIALIZE UPDATE with 6882 otherwise.
+        let mut card = card;
+        let _ = card.reconnect(pcsc::ShareMode::Shared, pcsc::Protocols::ANY,
+                               pcsc::Disposition::ResetCard);
         Ok(Self { card, reader: chosen })
     }
 }
 
 impl Transport for PcscTransport {
+    /// Every exchange is finished here, at the transport, so callers never see a bare 61xx:
+    /// the card asking for GET RESPONSE is a card that has data to give, not an error.
     fn transmit(&mut self, command: &[u8]) -> Result<Vec<u8>> {
-        let mut buf = [0u8; 4096];
-        let resp = self
-            .card
-            .transmit(command, &mut buf)
-            .context("card refused the command (was it removed?)")?;
-        Ok(resp.to_vec())
+        self.transmit_full(command)
     }
 
     fn describe(&self) -> String {
