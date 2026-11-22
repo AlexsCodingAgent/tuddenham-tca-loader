@@ -267,3 +267,29 @@ fn a_card_that_skips_install_for_load_is_reported_not_ignored() {
     assert!(err.contains("INSTALL [for load]"), "{err}");
     assert!(err.contains("6985"), "{err}");
 }
+
+#[test]
+fn checking_keys_costs_the_card_nothing_and_still_answers() {
+    // right keys: the cryptogram the mock computed from TEST_KEYS must verify
+    let mut card = MockCard::default();
+    let verdict = Session::check(&mut card, &TEST_KEYS).expect("challenge issued");
+    assert!(verdict.matches);
+    assert_eq!(verdict.challenge.mode, 8);
+
+    // and no EXTERNAL AUTHENTICATE was sent, so no retry counter moved
+    assert!(
+        !card.commands.iter().any(|c| c.len() > 1 && c[1] == 0x82),
+        "check must not authenticate"
+    );
+
+    // wrong keys: the same challenge, a different verdict
+    let mut card = MockCard::default();
+    let wrong = Scp03Keys {
+        enc: [0u8; 16],
+        mac: [0u8; 16],
+        dek: [0u8; 16],
+    };
+    let verdict = Session::check(&mut card, &wrong).expect("challenge still issued");
+    assert!(!verdict.matches);
+    assert!(!card.commands.iter().any(|c| c.len() > 1 && c[1] == 0x82));
+}

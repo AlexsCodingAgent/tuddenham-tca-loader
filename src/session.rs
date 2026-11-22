@@ -18,9 +18,28 @@ pub struct Session {
     pub sd_aid: Vec<u8>,
 }
 
+/// What the card disclosed in INITIALIZE UPDATE, before any key is used.
+#[derive(Debug, Clone)]
+pub struct CardChallenge {
+    pub host_challenge: Vec<u8>,
+    pub card_challenge: Vec<u8>,
+    pub card_cryptogram: Vec<u8>,
+    /// 8 for S8, 16 for S16.
+    pub mode: usize,
+    pub scp: u8,
+}
+
+/// The verdict of checking static keys against a card, which costs the card nothing: no
+/// EXTERNAL AUTHENTICATE is sent, so a wrong key does not spend an authentication attempt.
+#[derive(Debug, Clone)]
+pub struct KeyCheck {
+    pub matches: bool,
+    pub challenge: CardChallenge,
+}
+
 impl Session {
-    /// Ask the card for a challenge and prove we hold the static keys.
-    pub fn establish<T: Transport>(card: &mut T, keys: &Scp03Keys, security_level: u8) -> Result<Self> {
+    /// Ask the card for a challenge without presenting any key.
+    pub fn challenge<T: Transport>(card: &mut T) -> Result<CardChallenge> {
         let host_challenge = random_challenge();
         let cmd = Command::new(0x80, 0x50, 0x00, 0x00)
             .data(host_challenge.to_vec())
@@ -48,8 +67,9 @@ ISIM applet, not a GlobalPlatform security domain. Select the card manager AID f
         }
         // key diversification data (10), key version (1), SCP identifier (1), i (1), then the
         // card challenge and card cryptogram, each the length of the secure-channel mode
-        if body[11] != 0x03 {
-            bail!("card speaks SCP{:02X}, this loader speaks SCP03", body[11]);
+        let scp = body[11];
+        if scp != 0x03 {
+            bail!("card speaks SCP{:02X}, this loader speaks SCP03", scp);
         }
         let rest = body.len() - 13;
         if rest % 2 != 0 || !(16..=64).contains(&rest) {
@@ -59,13 +79,37 @@ ISIM applet, not a GlobalPlatform security domain. Select the card manager AID f
         let card_challenge = &body[13..13 + mode];
         let card_cryptogram = &body[13 + mode..13 + 2 * mode];
 
-        let expected = SessionKeys::card_cryptogram(keys, &host_challenge, card_challenge, mode);
-        if !constant_time_eq(&expected, card_cryptogram) {
+        Ok(CardChallenge {
+            host_challenge: host_challenge.to_vec(),
+            card_challenge: card_challenge.to_vec(),
+            card_cryptogram: card_cryptogram.to_vec(),
+            mode,
+            scp,
+        })
+    }
+
+    /// Test static keys against the card's cryptogram without authenticating. This is the safe way
+    /// to try a key set: the card never sees a wrong host cryptogram, so no retry is consumed.
+    pub fn check<T: Transport>(card: &mut T, keys: &Scp03Keys) -> Result<KeyCheck> {
+        let challenge = Self::challenge(card)?;
+        let expected = SessionKeys::card_cryptogram(
+            keys, &challenge.host_challenge, &challenge.card_challenge, challenge.mode);
+        let matches = constant_time_eq(&expected, &challenge.card_cryptogram);
+        Ok(KeyCheck { matches, challenge })
+    }
+
+    /// Ask the card for a challenge and prove we hold the static keys.
+    pub fn establish<T: Transport>(card: &mut T, keys: &Scp03Keys, security_level: u8) -> Result<Self> {
+        let challenge = Self::challenge(card)?;
+        let CardChallenge { host_challenge, card_challenge, card_cryptogram, mode, .. } = challenge;
+
+        let expected = SessionKeys::card_cryptogram(keys, &host_challenge, &card_challenge, mode);
+        if !constant_time_eq(&expected, &card_cryptogram) {
             bail!("card cryptogram did not verify: the static keys are not the card's");
         }
 
-        let session_keys = SessionKeys::derive(keys, &host_challenge, card_challenge, mode);
-        let host_cryptogram = SessionKeys::host_cryptogram(keys, &host_challenge, card_challenge, mode);
+        let session_keys = SessionKeys::derive(keys, &host_challenge, &card_challenge, mode);
+        let host_cryptogram = SessionKeys::host_cryptogram(keys, &host_challenge, &card_challenge, mode);
 
         let mut session = Self {
             keys: session_keys,

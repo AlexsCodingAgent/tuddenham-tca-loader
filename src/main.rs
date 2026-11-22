@@ -8,6 +8,13 @@ struct Cli {
     /// Reader name fragment; the first reader with a card is used when omitted.
     #[arg(long, global = true)]
     reader: Option<String>,
+    /// Static keys as enc:mac:dek in hex. Prefer --keys-file or the environment: a key on the
+    /// command line lands in shell history.
+    #[arg(long, global = true)]
+    keys: Option<String>,
+    /// File holding the keys, one line, enc:mac:dek in hex, or the same with comments.
+    #[arg(long, global = true)]
+    keys_file: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -23,9 +30,6 @@ enum Command {
         /// GlobalPlatform test keys (40..4F, 50..5F, 60..6F) instead of real ones.
         #[arg(long, default_value_t = true)]
         test_keys: bool,
-        /// Static keys as enc:mac:dek in hex, 16 bytes each.
-        #[arg(long)]
-        keys: Option<String>,
         /// Security level: 01 C-MAC only, 33 C-MAC plus C-DECRYPTION and response protection.
         #[arg(long, value_parser = parse_hex_u8, default_value = "01")]
         security_level: u8,
@@ -42,6 +46,12 @@ enum Command {
     /// Work out what the card is when the security domain does not answer at the usual AID:
     /// ATR, the EF_DIR application list, and a sweep of known security domain AIDs.
     Probe,
+    /// Try the keys against the card without authenticating, so a wrong key costs no attempt.
+    Check {
+        /// Security domain AID; the standard issuer domain is the default.
+        #[arg(long)]
+        sd: Option<String>,
+    },
     /// Read and decode the key information template: which key sets exist, of what type.
     Keys {
         /// Security domain AID; the standard issuer domain is the default.
@@ -89,9 +99,6 @@ enum Command {
         /// Install without making the application selectable.
         #[arg(long)]
         not_selectable: bool,
-        /// Static keys as enc:mac:dek in hex, 16 bytes each.
-        #[arg(long)]
-        keys: Option<String>,
     },
     /// Delete an application, load file or security domain by AID.
     Delete {
@@ -103,9 +110,6 @@ enum Command {
         /// Security domain AID to authenticate to.
         #[arg(long)]
         sd: Option<String>,
-        /// Static keys as enc:mac:dek in hex, 16 bytes each.
-        #[arg(long)]
-        keys: Option<String>,
     },
 }
 
@@ -114,19 +118,21 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Readers => list_readers(),
         Command::Info => info(cli.reader.as_deref()),
-        Command::Auth { test_keys: _, keys, security_level, aid } =>
-            auth(cli.reader.as_deref(), keys, security_level, aid),
+        Command::Auth { test_keys: _, security_level, aid } =>
+            auth(cli.reader.as_deref(), &cli.keys, &cli.keys_file, security_level, aid),
         Command::Status { isd_only } => status(cli.reader.as_deref(), isd_only),
         Command::Probe => probe(cli.reader.as_deref()),
         Command::Keys { sd } => keys(cli.reader.as_deref(), sd),
         Command::Raw { apdu, select } => raw(cli.reader.as_deref(), &apdu, select),
         Command::Cap { file, block_size } => cap_info(&file, block_size),
         Command::Load { file, sd, privileges, params, block_size, instance_aid, no_install,
-                        not_selectable, keys } =>
+                        not_selectable } =>
             load_cap(cli.reader.as_deref(), &file, sd, &privileges, params, block_size,
-                     instance_aid, no_install, not_selectable, keys),
-        Command::Delete { aid, related, sd, keys } =>
-            delete(cli.reader.as_deref(), &aid, related, sd, keys),
+                     instance_aid, no_install, not_selectable, &cli.keys, &cli.keys_file),
+        Command::Delete { aid, related, sd } =>
+            delete(cli.reader.as_deref(), &aid, related, sd, &cli.keys, &cli.keys_file),
+        Command::Check { sd } =>
+            check(cli.reader.as_deref(), sd, &cli.keys, &cli.keys_file),
     }
 }
 
@@ -137,6 +143,32 @@ fn parse_hex_u8(s: &str) -> std::result::Result<u8, String> {
 fn hex_bytes(spec: &str) -> Result<Vec<u8>> {
     hex::decode(spec.replace(' ', "").trim_start_matches("0x"))
         .map_err(|e| anyhow::anyhow!("not hex: {e}"))
+}
+
+/// Keys come from --keys, then --keys-file, then TCA_LOADER_KEYS, then the GlobalPlatform test
+/// keys. The order matters: the least exposed source wins.
+fn resolve_keys(spec: &Option<String>, file: &Option<String>) -> Result<tuddenham_tca_loader::scp03::Scp03Keys> {
+    if let Some(spec) = spec {
+        return parse_keys(spec);
+    }
+    if let Some(path) = file {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading keys from {path}"))?;
+        for line in text.lines() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            return parse_keys(line);
+        }
+        anyhow::bail!("{path} holds no key line");
+    }
+    if let Ok(spec) = std::env::var("TCA_LOADER_KEYS") {
+        if !spec.trim().is_empty() {
+            return parse_keys(&spec);
+        }
+    }
+    Ok(tuddenham_tca_loader::scp03::TEST_KEYS)
 }
 
 fn parse_keys(spec: &str) -> Result<tuddenham_tca_loader::scp03::Scp03Keys> {
@@ -156,13 +188,11 @@ fn parse_keys(spec: &str) -> Result<tuddenham_tca_loader::scp03::Scp03Keys> {
     Ok(tuddenham_tca_loader::scp03::Scp03Keys { enc: out[0], mac: out[1], dek: out[2] })
 }
 
-fn auth(reader: Option<&str>, keys: Option<String>, security_level: u8, aid: Option<String>) -> Result<()> {
+fn auth(reader: Option<&str>, keys: &Option<String>, keys_file: &Option<String>,
+        security_level: u8, aid: Option<String>) -> Result<()> {
     use tuddenham_tca_loader::session::Session;
 
-    let static_keys = match keys {
-        Some(spec) => parse_keys(&spec)?,
-        None => tuddenham_tca_loader::scp03::TEST_KEYS,
-    };
+    let static_keys = resolve_keys(keys, keys_file)?;
     let mut card = PcscTransport::open(reader)?;
     println!("reader: {}", card.describe());
 
@@ -318,7 +348,8 @@ fn load_cap(
     instance_aid: Option<String>,
     no_install: bool,
     not_selectable: bool,
-    keys: Option<String>,
+    keys: &Option<String>,
+    keys_file: &Option<String>,
 ) -> Result<()> {
     use tuddenham_tca_loader::cap::CapFile;
     use tuddenham_tca_loader::load::{load, LoadOptions};
@@ -339,7 +370,7 @@ fn load_cap(
              hex::encode(&cap.package_aid).to_uppercase(),
              cap.load_file.len(), cap.blocks(block_size).len());
 
-    let (mut card, mut session) = open_session(reader, sd, keys)?;
+    let (mut card, mut session) = open_session(reader, sd, keys, keys_file)?;
     let options = LoadOptions {
         block_size,
         privileges,
@@ -370,10 +401,11 @@ fn delete(
     aid: &str,
     related: bool,
     sd: Option<String>,
-    keys: Option<String>,
+    keys: &Option<String>,
+    keys_file: &Option<String>,
 ) -> Result<()> {
     let bytes = hex_bytes(aid)?;
-    let (mut card, mut session) = open_session(reader, sd, keys)?;
+    let (mut card, mut session) = open_session(reader, sd, keys, keys_file)?;
     tuddenham_tca_loader::load::delete(&mut card, &mut session, &bytes, related)?;
     println!("deleted {}{}", aid.to_uppercase(), if related { " and its objects" } else { "" });
     Ok(())
@@ -382,14 +414,12 @@ fn delete(
 fn open_session(
     reader: Option<&str>,
     sd: Option<String>,
-    keys: Option<String>,
+    keys: &Option<String>,
+    keys_file: &Option<String>,
 ) -> Result<(PcscTransport, tuddenham_tca_loader::session::Session)> {
     use tuddenham_tca_loader::session::Session;
 
-    let static_keys = match keys {
-        Some(spec) => parse_keys(&spec)?,
-        None => tuddenham_tca_loader::scp03::TEST_KEYS,
-    };
+    let static_keys = resolve_keys(keys, keys_file)?;
     let mut card = PcscTransport::open(reader)?;
     println!("reader: {}", card.describe());
 
@@ -620,5 +650,46 @@ fn keys(reader: Option<&str>, sd: Option<String>) -> Result<()> {
     println!("These are the key sets the card holds. Without the matching static keys the channel");
     println!("cannot be opened, and no loader can proceed; the values above are what you ask the");
     println!("card issuer for.");
+    Ok(())
+}
+
+fn check(reader: Option<&str>, sd: Option<String>, keys: &Option<String>, keys_file: &Option<String>) -> Result<()> {
+    use tuddenham_tca_loader::session::Session;
+
+    let static_keys = resolve_keys(keys, keys_file)?;
+    let mut card = PcscTransport::open(reader)?;
+    println!("reader: {}", card.describe());
+    let aid = match sd {
+        Some(spec) => hex_bytes(&spec)?,
+        None => hex::decode("A000000003000000").expect("constant"),
+    };
+    let mut select = vec![0x00u8, 0xA4, 0x04, 0x00, aid.len() as u8];
+    select.extend_from_slice(&aid);
+    select.push(0x00);
+    let resp = card.transmit_full(&select)?;
+    let sw = u16::from_be_bytes([resp[resp.len() - 2], resp[resp.len() - 1]]);
+    if sw != 0x9000 {
+        anyhow::bail!("selecting {} failed: {sw:04X}", hex::encode(&aid).to_uppercase());
+    }
+    println!("domain:  {}", hex::encode(&aid).to_uppercase());
+
+    let verdict = Session::check(&mut card, &static_keys)
+        .context("the card would not even issue a challenge")?;
+    println!("SCP:     SCP{:02X}, {}-byte cryptograms", verdict.challenge.scp, verdict.challenge.mode);
+    println!("card:    challenge {} cryptogram {}",
+             hex::encode(&verdict.challenge.card_challenge).to_uppercase(),
+             hex::encode(&verdict.challenge.card_cryptogram).to_uppercase());
+    if verdict.matches {
+        println!("keys:    MATCH. These keys open this card.");
+        println!();
+        println!("Nothing was authenticated yet, so no retry counter moved. Run `auth`, `load` or");
+        println!("`delete` with the same keys whenever you are ready.");
+    } else {
+        println!("keys:    do not match. The card computed a different cryptogram, so these are not\n");
+        println!("         its static keys. Nothing was sent that spends an authentication attempt.");
+        println!();
+        println!("Ask the issuer for the key set listed by `keys --sd {}`.",
+                 hex::encode(&aid).to_uppercase());
+    }
     Ok(())
 }
