@@ -29,8 +29,17 @@ impl PcscTransport {
             let raw = match self.card.transmit(&current, &mut buf) {
                 Ok(raw) => raw.to_vec(),
                 Err(_) => {
-                    let _ = self.card.reconnect(pcsc::ShareMode::Shared,
-                                                pcsc::Protocols::ANY,
+                    // reconnect on the protocol the card actually negotiated: asking for ANY
+                    // again is what pcsc rejects with "protocols are incompatible"
+                    let mut atr = [0u8; 64];
+                    let mut names = [0u8; 4096];
+                    let protocols = match self.card.status2(&mut atr, &mut names).ok()
+                        .and_then(|s| s.protocol2()) {
+                        Some(pcsc::Protocol::T0) => pcsc::Protocols::T0,
+                        Some(pcsc::Protocol::T1) => pcsc::Protocols::T1,
+                        _ => pcsc::Protocols::ANY,
+                    };
+                    let _ = self.card.reconnect(pcsc::ShareMode::Shared, protocols,
                                                 pcsc::Disposition::LeaveCard);
                     let again = self.card.transmit(&current, &mut buf)?;
                     again.to_vec()

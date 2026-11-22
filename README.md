@@ -11,7 +11,7 @@ SCP03 over HTTPS, and keeps SCP02, CAT-TP and SMS for older deployments.
 This project is the same job in the open: inspect the card, open a secure channel, load a CAP
 file, install an instance, delete what you no longer want.
 
-## The secure channel (SCP03)
+## Secure channels: SCP02 and SCP03
 
 ```
 $ tca-loader auth                     # GlobalPlatform test keys
@@ -19,17 +19,24 @@ $ tca-loader auth --keys enc:mac:dek  # real keys, 16 bytes each in hex
 $ tca-loader auth --security-level 33 # add C-DECRYPTION and response protection
 ```
 
-`auth` sends INITIALIZE UPDATE, checks the card cryptogram against the static keys, derives
-S-ENC, S-MAC and S-RMAC, sends EXTERNAL AUTHENTICATE, and then proves the channel by running a
-MAC-wrapped GET STATUS through it.
+`auth` sends INITIALIZE UPDATE, checks the card cryptogram against the static keys, derives the
+session keys, sends EXTERNAL AUTHENTICATE, and proves the channel with a MAC-wrapped GET STATUS.
+
+The card picks the protocol and the host follows: byte 11 of the INITIALIZE UPDATE response is the
+SCP identifier. **SCP03** is AES with a CMAC-based key derivation; **SCP02** is 3DES with a
+sequence counter and session keys derived by encrypting a sixteen-byte constant. Which keys to
+supply follows from that: 16-byte AES keys for SCP03, 16 or 24-byte 3DES keys for SCP02, and
+`--scp 02` forces the 3DES reading when a 16-byte key is ambiguous.
 
 Three things make this trustworthy without a card to test on:
 
 - CMAC is checked against the RFC 4493 vectors
-- the key derivation is checked against an independent implementation (pycryptodome, with
-  GlobalPlatform's field order rather than NIST's) for the standard test keys and a fixed pair
-  of challenges
+- both key derivations are checked against an independent implementation (pycryptodome) for the
+  standard test keys and fixed challenges: SCP03 with GlobalPlatform's field order rather than
+  NIST's, SCP02 with the 3DES constant derivation and the CBC-MAC cryptograms
 - the C-MAC chains, so the same command never carries the same MAC twice
+- an SCP02 mock card in the tests proves the whole path: challenge, sequence counter, cryptogram,
+  EXTERNAL AUTHENTICATE, and that a secured command arrives padded to a block boundary
 
 ### What the card in the reader says
 
@@ -108,6 +115,9 @@ security domain wants in its install parameters.
 ```
 $ tca-loader probe                      # ATR, EF_DIR, candidate AIDs, FCI and SCP parameters
 $ tca-loader keys --sd <aid>            # key versions, types and lengths
+$ tca-loader check --sd <aid>           # do these keys fit? no authentication attempt spent
+$ tca-loader audit --sd <aid>           # registry walk over an authenticated channel
+$ tca-loader dump --out card-report.txt # everything readable without keys, one file
 $ tca-loader raw 8050000008000102030405060700          # one APDU
 $ tca-loader raw "00A4000C023F00,00B2010426"           # several, sharing card state
 ```
@@ -184,9 +194,6 @@ scripted transport answers APDUs from a table.
 
 Stated plainly, because a loader that quietly omits a mode is worse than one that refuses:
 
-- **SCP02.** Cards that predate SCP03 (and many SIMs in the field) use SCP02, which is 3DES with
-  its own derivation and ICV rules. The tool speaks SCP03 only, and says so when a card reports
-  SCP02 rather than pretending to authenticate.
 - **DAP.** A Load File Data Block Hash can be passed, but there is no signing, no DAP block and
   no token handling, so a card that mandates verification will refuse the load.
 - **Extended APDUs.** Blocks are limited to 255 bytes, which is the classic limit; cards that
@@ -198,12 +205,10 @@ Stated plainly, because a loader that quietly omits a mode is worse than one tha
 
 ## Roadmap
 
-1. **SCP02**, so older SIMs and cards can be loaded rather than only inspected
-2. **DAP and tokens**, for security domains that mandate verification
-3. **Key management**: SET STATUS, PUT KEY, extradition
-4. **eUICC awareness**: ISD-R, ISD-P, ES10, so a profile is not mistaken for an application
-5. **Other transports**: CAT-TP over IP, SMS, and a relay for cards behind a modem
-6. **Audit**: registry walk, orphaned packages, key versions per domain
+1. **DAP and tokens**, for security domains that mandate verification
+2. **Key management**: SET STATUS, PUT KEY, extradition
+3. **eUICC awareness**: ISD-R, ISD-P, ES10, so a profile is not mistaken for an application
+4. **Other transports**: CAT-TP over IP, SMS, and a relay for cards behind a modem
 
 ## What this is not
 

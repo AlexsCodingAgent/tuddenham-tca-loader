@@ -9,6 +9,7 @@ use tuddenham_tca_loader::cap::CapFile;
 use tuddenham_tca_loader::card::Transport;
 use tuddenham_tca_loader::load::{load, LoadOptions};
 use tuddenham_tca_loader::scp03::{Scp03Keys, SessionKeys, TEST_KEYS};
+use tuddenham_tca_loader::session::StaticKeys;
 use tuddenham_tca_loader::session::Session;
 
 #[derive(Default)]
@@ -172,7 +173,7 @@ fn sample_cap(load_len: usize) -> CapFile {
 fn a_whole_load_round_trips_through_a_card() {
     let cap = sample_cap(600);
     let mut card = MockCard::default();
-    let mut session = Session::establish(&mut card, &TEST_KEYS, 0x01).expect("channel opens");
+    let mut session = Session::establish(&mut card, &StaticKeys::Scp03(TEST_KEYS), 0x01).expect("channel opens");
     assert_eq!(session.mode, 8, "the mock card offers S8");
 
     let mut progress_calls = 0usize;
@@ -197,7 +198,7 @@ fn a_whole_load_round_trips_through_a_card() {
 fn the_first_block_carries_c4_and_the_rest_do_not() {
     let cap = sample_cap(400);
     let mut card = MockCard::default();
-    let mut session = Session::establish(&mut card, &TEST_KEYS, 0x01).unwrap();
+    let mut session = Session::establish(&mut card, &StaticKeys::Scp03(TEST_KEYS), 0x01).unwrap();
     load(&mut card, &mut session, &cap, &LoadOptions::default(), |_, _| {}).unwrap();
 
     let loads: Vec<&Vec<u8>> = card.commands.iter()
@@ -216,7 +217,7 @@ fn the_first_block_carries_c4_and_the_rest_do_not() {
 fn install_names_the_domain_and_the_instance() {
     let cap = sample_cap(120);
     let mut card = MockCard::default();
-    let mut session = Session::establish(&mut card, &TEST_KEYS, 0x01).unwrap();
+    let mut session = Session::establish(&mut card, &StaticKeys::Scp03(TEST_KEYS), 0x01).unwrap();
     load(&mut card, &mut session, &cap, &LoadOptions { privileges: 0, ..Default::default() }, |_, _| {})
         .unwrap();
 
@@ -260,7 +261,7 @@ fn a_card_that_skips_install_for_load_is_reported_not_ignored() {
 
     let cap = sample_cap(50);
     let mut card = Refusing;
-    let mut session = Session::establish(&mut card, &TEST_KEYS, 0x01).unwrap();
+    let mut session = Session::establish(&mut card, &StaticKeys::Scp03(TEST_KEYS), 0x01).unwrap();
     let err = load(&mut card, &mut session, &cap, &LoadOptions::default(), |_, _| {})
         .unwrap_err()
         .to_string();
@@ -272,7 +273,7 @@ fn a_card_that_skips_install_for_load_is_reported_not_ignored() {
 fn checking_keys_costs_the_card_nothing_and_still_answers() {
     // right keys: the cryptogram the mock computed from TEST_KEYS must verify
     let mut card = MockCard::default();
-    let verdict = Session::check(&mut card, &TEST_KEYS).expect("challenge issued");
+    let verdict = Session::check(&mut card, &StaticKeys::Scp03(TEST_KEYS)).expect("challenge issued");
     assert!(verdict.matches);
     assert_eq!(verdict.challenge.mode, 8);
 
@@ -289,7 +290,107 @@ fn checking_keys_costs_the_card_nothing_and_still_answers() {
         mac: [0u8; 16],
         dek: [0u8; 16],
     };
-    let verdict = Session::check(&mut card, &wrong).expect("challenge still issued");
+    let verdict = Session::check(&mut card, &StaticKeys::Scp03(wrong)).expect("challenge still issued");
     assert!(!verdict.matches);
     assert!(!card.commands.iter().any(|c| c.len() > 1 && c[1] == 0x82));
+}
+
+/// A card that speaks SCP02: 3DES keys, a sequence counter, six-byte card challenge.
+struct Scp02Card {
+    host_challenge: Vec<u8>,
+    card_challenge: Vec<u8>,
+    sequence: Vec<u8>,
+    keys: tuddenham_tca_loader::scp02::Scp02Keys,
+    authenticated: bool,
+    seen_padded: bool,
+}
+
+impl Scp02Card {
+    fn new() -> Self {
+        Self {
+            host_challenge: Vec::new(),
+            card_challenge: vec![0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D],
+            sequence: vec![0x00, 0x01],
+            keys: tuddenham_tca_loader::scp02::Scp02Keys {
+                enc: hex::decode("404142434445464748494A4B4C4D4E4F").unwrap(),
+                mac: hex::decode("505152535455565758595A5B5C5D5E5F").unwrap(),
+                dek: hex::decode("606162636465666768696A6B6C6D6E6F").unwrap(),
+            },
+            authenticated: false,
+            seen_padded: false,
+        }
+    }
+}
+
+impl Transport for Scp02Card {
+    fn transmit(&mut self, command: &[u8]) -> Result<Vec<u8>> {
+        let ins = command[1];
+        let data: &[u8] = if command.len() > 5 { &command[5..] } else { &[] };
+        match ins {
+            0x50 => {
+                self.host_challenge = data[..8].to_vec();
+                let cryptogram = tuddenham_tca_loader::scp02::Scp02Session::card_cryptogram(
+                    &self.keys, &self.host_challenge, &self.sequence, &self.card_challenge);
+                let mut out = vec![0u8; 10];
+                out.extend_from_slice(&[0x01, 0x02]);
+                out.extend_from_slice(&self.sequence);
+                out.extend_from_slice(&self.card_challenge);
+                out.extend_from_slice(&cryptogram);
+                out.extend_from_slice(&[0x90, 0x00]);
+                Ok(out)
+            }
+            0x82 => {
+                let expected = tuddenham_tca_loader::scp02::Scp02Session::host_cryptogram(
+                    &self.keys, &self.host_challenge, &self.sequence, &self.card_challenge);
+                if data.len() < 16 || data[..8] != expected[..] {
+                    return Ok(vec![0x63, 0x00]);
+                }
+                self.authenticated = true;
+                Ok(vec![0x90, 0x00])
+            }
+            _ => {
+                // a secured command: SCP02 pads the data, so the length must be a multiple of 8
+                if !self.authenticated {
+                    return Ok(vec![0x69, 0x82]);
+                }
+                let lc = command[4] as usize;
+                if (lc - 8) % 8 == 0 {
+                    self.seen_padded = true;
+                }
+                Ok(vec![0x90, 0x00])
+            }
+        }
+    }
+
+    fn describe(&self) -> String {
+        "scp02 mock".into()
+    }
+}
+
+#[test]
+fn scp02_authenticates_and_wraps_with_padding() {
+    let mut card = Scp02Card::new();
+    let keys = tuddenham_tca_loader::session::StaticKeys::Scp02(card.keys.clone());
+
+    let check = Session::check(&mut card, &keys).expect("challenge issued");
+    assert!(check.matches, "test keys must verify against the mock's cryptogram");
+    assert_eq!(check.challenge.scp, 0x02);
+
+    let mut session = Session::establish(&mut card, &keys, 0x01).expect("SCP02 channel opens");
+    assert_eq!(session.scp, 0x02);
+    assert_eq!(session.mode, 8);
+
+    // a wrapped command must arrive padded to a block boundary plus an 8-byte MAC
+    let resp = session.execute(&mut card, 0x80, 0xF2, 0x80, 0x00, &[0x4F, 0x00], Some(0x00)).unwrap();
+    assert!(resp.is_ok());
+    assert!(card.seen_padded, "SCP02 pads command data before MACing it");
+}
+
+#[test]
+fn aes_keys_against_an_scp02_card_say_so() {
+    let mut card = Scp02Card::new();
+    let err = Session::establish(&mut card, &StaticKeys::Scp03(TEST_KEYS), 0x01)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("3DES"), "{err}");
 }

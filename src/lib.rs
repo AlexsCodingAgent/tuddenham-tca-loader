@@ -21,6 +21,7 @@ pub mod card;
 pub mod commands;
 pub mod gp;
 pub mod load;
+pub mod scp02;
 pub mod scp03;
 pub mod session;
 pub mod tlv;

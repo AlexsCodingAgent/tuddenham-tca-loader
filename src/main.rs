@@ -15,6 +15,10 @@ struct Cli {
     /// File holding the keys, one line, enc:mac:dek in hex, or the same with comments.
     #[arg(long, global = true)]
     keys_file: Option<String>,
+    /// Force the secure channel the keys belong to: 02 (3DES) or 03 (AES). Guessed from key
+    /// length otherwise: 24 bytes means 3DES, 16 means AES.
+    #[arg(long, global = true)]
+    scp: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -51,6 +55,18 @@ enum Command {
         /// Security domain AID; the standard issuer domain is the default.
         #[arg(long)]
         sd: Option<String>,
+    },
+    /// Walk the registry over an authenticated channel: what is installed, in what state.
+    Audit {
+        /// Security domain AID; the standard issuer domain is the default.
+        #[arg(long)]
+        sd: Option<String>,
+    },
+    /// Write everything the card discloses without keys to one file, for a support ticket.
+    Dump {
+        /// Where to write the report.
+        #[arg(long, default_value = "card-report.txt")]
+        out: String,
     },
     /// Read and decode the key information template: which key sets exist, of what type.
     Keys {
@@ -119,7 +135,7 @@ fn main() -> Result<()> {
         Command::Readers => list_readers(),
         Command::Info => info(cli.reader.as_deref()),
         Command::Auth { test_keys: _, security_level, aid } =>
-            auth(cli.reader.as_deref(), &cli.keys, &cli.keys_file, security_level, aid),
+            auth(cli.reader.as_deref(), &cli.keys, &cli.keys_file, &cli.scp, security_level, aid),
         Command::Status { isd_only } => status(cli.reader.as_deref(), isd_only),
         Command::Probe => probe(cli.reader.as_deref()),
         Command::Keys { sd } => keys(cli.reader.as_deref(), sd),
@@ -128,11 +144,14 @@ fn main() -> Result<()> {
         Command::Load { file, sd, privileges, params, block_size, instance_aid, no_install,
                         not_selectable } =>
             load_cap(cli.reader.as_deref(), &file, sd, &privileges, params, block_size,
-                     instance_aid, no_install, not_selectable, &cli.keys, &cli.keys_file),
+                     instance_aid, no_install, not_selectable, &cli.keys, &cli.keys_file, &cli.scp),
         Command::Delete { aid, related, sd } =>
-            delete(cli.reader.as_deref(), &aid, related, sd, &cli.keys, &cli.keys_file),
+            delete(cli.reader.as_deref(), &aid, related, sd, &cli.keys, &cli.keys_file, &cli.scp),
+        Command::Audit { sd } =>
+            audit(cli.reader.as_deref(), sd, &cli.keys, &cli.keys_file, &cli.scp),
+        Command::Dump { out } => dump(cli.reader.as_deref(), &out),
         Command::Check { sd } =>
-            check(cli.reader.as_deref(), sd, &cli.keys, &cli.keys_file),
+            check(cli.reader.as_deref(), sd, &cli.keys, &cli.keys_file, &cli.scp),
     }
 }
 
@@ -147,9 +166,10 @@ fn hex_bytes(spec: &str) -> Result<Vec<u8>> {
 
 /// Keys come from --keys, then --keys-file, then TCA_LOADER_KEYS, then the GlobalPlatform test
 /// keys. The order matters: the least exposed source wins.
-fn resolve_keys(spec: &Option<String>, file: &Option<String>) -> Result<tuddenham_tca_loader::scp03::Scp03Keys> {
+fn resolve_keys(spec: &Option<String>, file: &Option<String>, scp: &Option<String>)
+    -> Result<tuddenham_tca_loader::session::StaticKeys> {
     if let Some(spec) = spec {
-        return parse_keys(spec);
+        return parse_keys(spec, scp.as_deref());
     }
     if let Some(path) = file {
         let text = std::fs::read_to_string(path)
@@ -159,40 +179,65 @@ fn resolve_keys(spec: &Option<String>, file: &Option<String>) -> Result<tuddenha
             if line.is_empty() {
                 continue;
             }
-            return parse_keys(line);
+            return parse_keys(line, scp.as_deref());
         }
         anyhow::bail!("{path} holds no key line");
     }
     if let Ok(spec) = std::env::var("TCA_LOADER_KEYS") {
         if !spec.trim().is_empty() {
-            return parse_keys(&spec);
+            return parse_keys(&spec, scp.as_deref());
         }
     }
-    Ok(tuddenham_tca_loader::scp03::TEST_KEYS)
+    Ok(tuddenham_tca_loader::session::StaticKeys::Scp03(
+        tuddenham_tca_loader::scp03::TEST_KEYS))
 }
 
-fn parse_keys(spec: &str) -> Result<tuddenham_tca_loader::scp03::Scp03Keys> {
+fn parse_keys(spec: &str, scp: Option<&str>) -> Result<tuddenham_tca_loader::session::StaticKeys> {
+    use tuddenham_tca_loader::scp02::Scp02Keys;
+    use tuddenham_tca_loader::scp03::Scp03Keys;
+    use tuddenham_tca_loader::session::StaticKeys;
+
     let parts: Vec<&str> = spec.split(':').collect();
     if parts.len() != 3 {
-        anyhow::bail!("keys must be enc:mac:dek, 32 hex characters each");
+        anyhow::bail!("keys must be enc:mac:dek, hex, all three the same length");
     }
-    let mut out = [[0u8; 16]; 3];
+    let mut keys: Vec<Vec<u8>> = Vec::new();
     for (i, part) in parts.iter().enumerate() {
-        let bytes = hex::decode(part.replace(' ', ""))
-            .map_err(|e| anyhow::anyhow!("key {i} is not hex: {e}"))?;
-        if bytes.len() != 16 {
-            anyhow::bail!("key {i} is {} bytes, expected 16", bytes.len());
-        }
-        out[i].copy_from_slice(&bytes);
+        keys.push(hex::decode(part.replace(' ', ""))
+            .map_err(|e| anyhow::anyhow!("key {i} is not hex: {e}"))?);
     }
-    Ok(tuddenham_tca_loader::scp03::Scp03Keys { enc: out[0], mac: out[1], dek: out[2] })
+    let length = keys[0].len();
+    if keys.iter().any(|k| k.len() != length) {
+        anyhow::bail!("all three keys must be the same length");
+    }
+    let protocol = match scp {
+        Some("02") => 2,
+        Some("03") => 3,
+        Some(other) => anyhow::bail!("--scp must be 02 or 03, not {other}"),
+        None => if length == 24 { 2 } else { 3 },
+    };
+    match (protocol, length) {
+        (3, 16) => Ok(StaticKeys::Scp03(Scp03Keys {
+            enc: keys[0].clone().try_into().expect("16"),
+            mac: keys[1].clone().try_into().expect("16"),
+            dek: keys[2].clone().try_into().expect("16"),
+        })),
+        (3, other) => anyhow::bail!("SCP03 keys are 16 bytes, these are {other}"),
+        (2, 16 | 24) => Ok(StaticKeys::Scp02(Scp02Keys {
+            enc: keys[0].clone(),
+            mac: keys[1].clone(),
+            dek: keys[2].clone(),
+        })),
+        (2, other) => anyhow::bail!("SCP02 keys are 16 or 24 bytes, these are {other}"),
+        _ => unreachable!(),
+    }
 }
 
 fn auth(reader: Option<&str>, keys: &Option<String>, keys_file: &Option<String>,
-        security_level: u8, aid: Option<String>) -> Result<()> {
+        scp: &Option<String>, security_level: u8, aid: Option<String>) -> Result<()> {
     use tuddenham_tca_loader::session::Session;
 
-    let static_keys = resolve_keys(keys, keys_file)?;
+    let static_keys = resolve_keys(keys, keys_file, scp)?;
     let mut card = PcscTransport::open(reader)?;
     println!("reader: {}", card.describe());
 
@@ -350,6 +395,7 @@ fn load_cap(
     not_selectable: bool,
     keys: &Option<String>,
     keys_file: &Option<String>,
+    scp: &Option<String>,
 ) -> Result<()> {
     use tuddenham_tca_loader::cap::CapFile;
     use tuddenham_tca_loader::load::{load, LoadOptions};
@@ -370,7 +416,7 @@ fn load_cap(
              hex::encode(&cap.package_aid).to_uppercase(),
              cap.load_file.len(), cap.blocks(block_size).len());
 
-    let (mut card, mut session) = open_session(reader, sd, keys, keys_file)?;
+    let (mut card, mut session) = open_session(reader, sd, keys, keys_file, scp)?;
     let options = LoadOptions {
         block_size,
         privileges,
@@ -403,9 +449,10 @@ fn delete(
     sd: Option<String>,
     keys: &Option<String>,
     keys_file: &Option<String>,
+    scp: &Option<String>,
 ) -> Result<()> {
     let bytes = hex_bytes(aid)?;
-    let (mut card, mut session) = open_session(reader, sd, keys, keys_file)?;
+    let (mut card, mut session) = open_session(reader, sd, keys, keys_file, scp)?;
     tuddenham_tca_loader::load::delete(&mut card, &mut session, &bytes, related)?;
     println!("deleted {}{}", aid.to_uppercase(), if related { " and its objects" } else { "" });
     Ok(())
@@ -416,10 +463,11 @@ fn open_session(
     sd: Option<String>,
     keys: &Option<String>,
     keys_file: &Option<String>,
+    scp: &Option<String>,
 ) -> Result<(PcscTransport, tuddenham_tca_loader::session::Session)> {
     use tuddenham_tca_loader::session::Session;
 
-    let static_keys = resolve_keys(keys, keys_file)?;
+    let static_keys = resolve_keys(keys, keys_file, scp)?;
     let mut card = PcscTransport::open(reader)?;
     println!("reader: {}", card.describe());
 
@@ -441,8 +489,8 @@ fn open_session(
     let mut session = Session::establish(&mut card, &static_keys, 0x01)
         .context("opening the secure channel")?;
     session.sd_aid = sd_bytes;
-    println!("secure channel: SCP03, {}-byte MAC, domain {}",
-             session.mode, hex::encode(&session.sd_aid).to_uppercase());
+    println!("secure channel: SCP{:02X}, {}-byte MAC, domain {}",
+             session.scp, session.mode, hex::encode(&session.sd_aid).to_uppercase());
     Ok((card, session))
 }
 
@@ -653,10 +701,11 @@ fn keys(reader: Option<&str>, sd: Option<String>) -> Result<()> {
     Ok(())
 }
 
-fn check(reader: Option<&str>, sd: Option<String>, keys: &Option<String>, keys_file: &Option<String>) -> Result<()> {
+fn check(reader: Option<&str>, sd: Option<String>, keys: &Option<String>,
+         keys_file: &Option<String>, scp: &Option<String>) -> Result<()> {
     use tuddenham_tca_loader::session::Session;
 
-    let static_keys = resolve_keys(keys, keys_file)?;
+    let static_keys = resolve_keys(keys, keys_file, scp)?;
     let mut card = PcscTransport::open(reader)?;
     println!("reader: {}", card.describe());
     let aid = match sd {
@@ -675,7 +724,9 @@ fn check(reader: Option<&str>, sd: Option<String>, keys: &Option<String>, keys_f
 
     let verdict = Session::check(&mut card, &static_keys)
         .context("the card would not even issue a challenge")?;
-    println!("SCP:     SCP{:02X}, {}-byte cryptograms", verdict.challenge.scp, verdict.challenge.mode);
+    println!("SCP:     SCP{:02X}, {}-byte {}", verdict.challenge.scp,
+             if verdict.challenge.scp == 0x02 { 8 } else { verdict.challenge.mode },
+             if verdict.challenge.scp == 0x02 { "MAC" } else { "cryptograms" });
     println!("card:    challenge {} cryptogram {}",
              hex::encode(&verdict.challenge.card_challenge).to_uppercase(),
              hex::encode(&verdict.challenge.card_cryptogram).to_uppercase());
@@ -691,5 +742,129 @@ fn check(reader: Option<&str>, sd: Option<String>, keys: &Option<String>, keys_f
         println!("Ask the issuer for the key set listed by `keys --sd {}`.",
                  hex::encode(&aid).to_uppercase());
     }
+    Ok(())
+}
+
+fn audit(reader: Option<&str>, sd: Option<String>, keys: &Option<String>,
+         keys_file: &Option<String>, scp: &Option<String>) -> Result<()> {
+    let (mut card, mut session) = open_session(reader, sd, keys, keys_file, scp)?;
+    let resp = session.execute(&mut card, 0x80, 0xF2, 0x40, 0x00, &[0x4F, 0x00], Some(0x00))?;
+    if !resp.is_ok() {
+        anyhow::bail!("GET STATUS over the channel failed: {} ({:04X})",
+                      resp.describe(), resp.status());
+    }
+    let entries = tuddenham_tca_loader::gp::parse_get_status(&resp.data);
+    println!();
+    println!("{:<34} {:<14} {}", "AID", "STATE", "PRIVILEGES");
+    let mut counts = std::collections::BTreeMap::new();
+    for entry in entries.iter() {
+        println!("{:<34} {:<14} {:02X?}",
+                 entry.aid_hex(), entry.life_cycle_short(), entry.privileges);
+        *counts.entry(entry.life_cycle_short().to_string()).or_insert(0) += 1;
+    }
+    println!();
+    println!("{} entries", entries.len());
+    for (state, count) in counts {
+        println!("  {:<14} {count}", state);
+    }
+    Ok(())
+}
+
+fn dump(reader: Option<&str>, out: &str) -> Result<()> {
+    use std::io::Write;
+
+    let mut card = PcscTransport::open(reader)?;
+    let mut report = String::new();
+    report.push_str(&format!("reader: {}\n", card.describe()));
+    report.push_str(&format!("ATR:    {}\n",
+        card.atr_hex().unwrap_or_else(|e| format!("unavailable ({e})"))));
+
+    fn sw_of(raw: &[u8]) -> u16 {
+        if raw.len() >= 2 {
+            u16::from_be_bytes([raw[raw.len() - 2], raw[raw.len() - 1]])
+        } else { 0 }
+    }
+    fn select(card: &mut PcscTransport, aid: &[u8]) -> Result<(Vec<u8>, u16)> {
+        let mut apdu = vec![0x00u8, 0xA4, 0x04, 0x00, aid.len() as u8];
+        apdu.extend_from_slice(aid);
+        apdu.push(0x00);
+        let raw = card.transmit_full(&apdu)?;
+        Ok((raw[..raw.len().saturating_sub(2)].to_vec(), sw_of(&raw)))
+    }
+
+    // EF_DIR: the applications the card actually holds. Files are selected by FID, not by AID.
+    let _ = card.transmit_full(&[0x00u8, 0xA4, 0x00, 0x0C, 0x02, 0x3F, 0x00]);
+    let dir_raw = card.transmit_full(&[0x00u8, 0xA4, 0x00, 0x0C, 0x02, 0x2F, 0x00])?;
+    let sw = sw_of(&dir_raw);
+    report.push_str("\napplications (EF_DIR):\n");
+    if sw != 0x9000 {
+        report.push_str(&format!("  not readable ({sw:04X})\n"));
+    } else {
+        for record in 1u8..=20 {
+            let raw = card.transmit_full(&[0x00u8, 0xB2, record, 0x04, 0x26])?;
+            if sw_of(&raw) != 0x9000 {
+                break;
+            }
+            let body = &raw[..raw.len() - 2];
+            let mut aid = String::from("-");
+            let mut label = String::from("-");
+            let mut at = 0usize;
+            while at + 2 <= body.len() {
+                let tag = body[at];
+                let len = body[at + 1] as usize;
+                if at + 2 + len > body.len() {
+                    break;
+                }
+                let value = &body[at + 2..at + 2 + len];
+                if tag == 0x61 {
+                    let mut inner = 0usize;
+                    while inner + 2 <= value.len() {
+                        let t2 = value[inner];
+                        let l2 = value[inner + 1] as usize;
+                        if inner + 2 + l2 > value.len() {
+                            break;
+                        }
+                        let v2 = &value[inner + 2..inner + 2 + l2];
+                        match t2 {
+                            0x4F => aid = hex::encode(v2).to_uppercase(),
+                            0x50 => label = String::from_utf8_lossy(v2).trim().to_string(),
+                            _ => {}
+                        }
+                        inner += 2 + l2;
+                    }
+                }
+                at += 2 + len;
+            }
+            report.push_str(&format!("  {aid}  {label}\n"));
+        }
+    }
+
+    // the card manager, if there is one at any of the usual AIDs
+    report.push_str("\ncard manager:\n");
+    let mut found = false;
+    for (name, aid_hex) in [
+        ("GP issuer domain", "A000000003000000"),
+        ("GP card manager", "A000000151000000"),
+        ("GSMA ISD-R", "A0000005591010FFFFFF8901000000"),
+    ] {
+        let bytes = hex::decode(aid_hex).expect("constant");
+        let (fci, sw) = select(&mut card, &bytes)?;
+        report.push_str(&format!("  {name:<22} {aid_hex}  {sw:04X}\n"));
+        if sw == 0x9000 {
+            found = true;
+            report.push_str(&format!("    FCI: {}\n", hex::encode(&fci).to_uppercase()));
+            let raw = card.transmit_full(&[0x80u8, 0xCA, 0x00, 0xE0, 0x20])?;
+            report.push_str(&format!("    keys: {:04X} {}\n",
+                sw_of(&raw), hex::encode(&raw[..raw.len().saturating_sub(2)]).to_uppercase()));
+        }
+    }
+    if !found {
+        report.push_str("  none answered at the standard AIDs\n");
+    }
+
+    let mut file = std::fs::File::create(out)
+        .with_context(|| format!("writing {out}"))?;
+    file.write_all(report.as_bytes())?;
+    println!("wrote {out} ({} bytes)", report.len());
     Ok(())
 }
