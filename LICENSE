@@ -1,21 +1,52 @@
-MIT License
+COMMERCIAL LICENSE
+==================
 
-Copyright (c) 2026 Alex Tuddenham
+Copyright (c) 2026 Alex Tuddenham. All rights reserved.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+This software and its documentation (the "Software") are proprietary. They are
+made available for inspection and evaluation only. No other rights are granted.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+1. PERMITTED USE
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+   You may read the Software and run it for the purpose of evaluating whether to
+   obtain a commercial licence. Evaluation use is limited to thirty (30) days and
+   must not be for the benefit of any third party.
+
+2. RESTRICTIONS
+
+   Without a separate written licence agreement signed by the copyright holder,
+   you may not:
+
+   a. use the Software in production, in a commercial product, in a service
+      offered to third parties, or to perform work for a client;
+   b. copy, modify, adapt, translate or create derivative works from the Software;
+   c. distribute, sublicense, publish, sell, rent, lease or otherwise make the
+      Software available to any third party, in source or binary form;
+   d. incorporate the Software, in whole or in part, into another product;
+   e. remove or alter this notice or any other proprietary marking.
+
+3. NO TRADE SECRETS WAIVER
+
+   Publication of the source code is not a waiver of any trade secret, copyright
+   or other right in the Software, and does not grant any implied licence.
+
+4. THIRD-PARTY COMPONENTS
+
+   The Software depends on third-party crates that carry their own licences. Those
+   licences continue to govern those components. This notice governs only the
+   code in this repository.
+
+5. NO WARRANTY
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY ARISING
+   FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR ITS USE.
+
+6. LICENSING ENQUIRIES
+
+   Commercial licensing, including terms for redistribution in a product, is
+   available on request from the copyright holder.
+
+SPDX-License-Identifier: LicenseRef-Proprietary

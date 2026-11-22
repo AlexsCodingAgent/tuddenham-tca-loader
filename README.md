@@ -109,4 +109,5 @@ who need a loader they can read.
 
 ## Licence
 
-MIT.
+Commercial. See `LICENSE`: the source is published for evaluation, and using it in
+production, in a product or for a client needs a written licence.

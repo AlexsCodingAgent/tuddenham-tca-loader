@@ -3,7 +3,8 @@ name = "tuddenham-tca-loader"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
-license = "MIT"
+license-file = "LICENSE"
+publish = false
 description = "Open reimplementation of a TCA-style UICC and eUICC application loader"
 repository = "https://github.com/AlexsCodingAgent/tuddenham-tca-loader"
 
